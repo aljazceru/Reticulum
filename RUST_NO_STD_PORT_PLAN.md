@@ -1165,6 +1165,1187 @@ proptest! {
 }
 ```
 
+### 7.6 Automated Python Integration Testing Framework
+
+**Goal:** Create a continuous feedback loop using the Python implementation as a reference oracle to automatically discover issues and validate correct behavior throughout development.
+
+#### 7.6.1 Test Infrastructure Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    CI/CD Pipeline (GitHub Actions)          │
+├─────────────────────────────────────────────────────────────┤
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
+│  │  Unit Tests  │  │  Integration │  │   Compat     │     │
+│  │   (Rust)     │  │    Tests     │  │   Tests      │     │
+│  └──────────────┘  └──────────────┘  └──────────────┘     │
+│         │                  │                  │             │
+│         └──────────────────┴──────────────────┘             │
+│                            ▼                                │
+│              ┌──────────────────────────┐                   │
+│              │  Test Orchestrator       │                   │
+│              │  (Python + Rust)         │                   │
+│              └──────────────────────────┘                   │
+│                     │           │                           │
+│         ┌───────────┴───┐   ┌──┴────────────┐             │
+│         ▼               ▼   ▼               ▼             │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐            │
+│  │  Rust    │◄──►│  Python  │◄──►│  Python  │            │
+│  │  Node    │    │  Node 1  │    │  Node 2  │            │
+│  └──────────┘    └──────────┘    └──────────┘            │
+│       │               │                │                   │
+│       └───────────────┴────────────────┘                   │
+│                       ▼                                     │
+│            ┌──────────────────────┐                        │
+│            │  Validation Engine   │                        │
+│            │  - Packet capture    │                        │
+│            │  - State comparison  │                        │
+│            │  - Timing analysis   │                        │
+│            └──────────────────────┘                        │
+│                       ▼                                     │
+│            ┌──────────────────────┐                        │
+│            │  Results Dashboard   │                        │
+│            │  - Pass/Fail         │                        │
+│            │  - Diff reports      │                        │
+│            │  - Coverage metrics  │                        │
+│            └──────────────────────┘                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 7.6.2 Test Harness Implementation
+
+**Test Orchestrator (Python):**
+```python
+# tests/integration/orchestrator.py
+import RNS
+import subprocess
+import socket
+import json
+import time
+from dataclasses import dataclass
+from enum import Enum
+
+class NodeType(Enum):
+    PYTHON = "python"
+    RUST = "rust"
+
+@dataclass
+class TestNode:
+    node_type: NodeType
+    process: subprocess.Popen
+    control_socket: socket.socket
+    data_port: int
+    identity_hash: bytes
+
+class TestOrchestrator:
+    def __init__(self):
+        self.nodes = []
+        self.packet_capture = []
+        self.validation_errors = []
+
+    def spawn_python_node(self, config: dict) -> TestNode:
+        """Spawn a Python Reticulum node with given config"""
+        # Create temporary config file
+        config_path = self.create_temp_config(config)
+
+        # Start Python node
+        process = subprocess.Popen(
+            ["python", "-m", "RNS.Utilities.rnsd", "-c", config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        # Connect to control socket
+        control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        control_socket.connect(f"/tmp/rns_test_{process.pid}")
+
+        return TestNode(
+            node_type=NodeType.PYTHON,
+            process=process,
+            control_socket=control_socket,
+            data_port=config['port'],
+            identity_hash=self.get_node_identity(control_socket)
+        )
+
+    def spawn_rust_node(self, config: dict) -> TestNode:
+        """Spawn a Rust Reticulum node with given config"""
+        # Convert config to TOML for Rust
+        config_path = self.create_temp_toml_config(config)
+
+        # Build and start Rust node
+        process = subprocess.Popen(
+            ["cargo", "run", "--release", "--", "-c", config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd="../reticulum"
+        )
+
+        # Connect to control API (JSON-RPC over Unix socket)
+        control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        control_socket.connect(f"/tmp/rns_rust_test_{process.pid}")
+
+        return TestNode(
+            node_type=NodeType.RUST,
+            process=process,
+            control_socket=control_socket,
+            data_port=config['port'],
+            identity_hash=self.get_rust_node_identity(control_socket)
+        )
+
+    def create_test_topology(self, topology: str):
+        """Create network topology for testing
+
+        Topologies:
+        - "linear": A <-> B <-> C
+        - "star": B <-> A, C <-> A, D <-> A
+        - "mesh": A <-> B, B <-> C, C <-> A
+        - "mixed": Mix of Python and Rust nodes
+        """
+        if topology == "linear_rust_python_rust":
+            # Rust <-> Python <-> Rust
+            self.nodes.append(self.spawn_rust_node({
+                'port': 4242,
+                'interfaces': [{'type': 'tcp', 'port': 4242}]
+            }))
+
+            self.nodes.append(self.spawn_python_node({
+                'port': 4243,
+                'interfaces': [
+                    {'type': 'tcp', 'port': 4243},
+                    {'type': 'tcp', 'target': 'localhost:4242'},
+                    {'type': 'tcp', 'target': 'localhost:4244'}
+                ]
+            }))
+
+            self.nodes.append(self.spawn_rust_node({
+                'port': 4244,
+                'interfaces': [{'type': 'tcp', 'port': 4244}]
+            }))
+
+    def run_test_scenario(self, scenario: dict) -> bool:
+        """Run a test scenario and validate results"""
+        scenario_name = scenario['name']
+        print(f"Running scenario: {scenario_name}")
+
+        # Execute test steps
+        for step in scenario['steps']:
+            self.execute_step(step)
+
+        # Validate results
+        return self.validate_scenario(scenario)
+
+    def execute_step(self, step: dict):
+        """Execute a single test step"""
+        action = step['action']
+
+        if action == 'send_packet':
+            self.send_packet(
+                from_node=step['from'],
+                to_dest=step['to'],
+                data=step['data']
+            )
+        elif action == 'announce':
+            self.announce_destination(
+                node=step['node'],
+                app_name=step['app_name'],
+                aspect=step['aspect']
+            )
+        elif action == 'establish_link':
+            self.establish_link(
+                from_node=step['from'],
+                to_dest=step['to']
+            )
+        elif action == 'transfer_resource':
+            self.transfer_resource(
+                link=step['link'],
+                data=step['data']
+            )
+        elif action == 'wait':
+            time.sleep(step['duration'])
+
+    def validate_scenario(self, scenario: dict) -> bool:
+        """Validate scenario results"""
+        validations = scenario.get('validations', [])
+        all_passed = True
+
+        for validation in validations:
+            validator = validation['type']
+
+            if validator == 'packet_received':
+                passed = self.validate_packet_received(
+                    node=validation['node'],
+                    expected_data=validation['data']
+                )
+            elif validator == 'link_established':
+                passed = self.validate_link_established(
+                    from_node=validation['from'],
+                    to_node=validation['to']
+                )
+            elif validator == 'path_exists':
+                passed = self.validate_path_exists(
+                    from_node=validation['from'],
+                    to_dest=validation['dest']
+                )
+            elif validator == 'announce_propagated':
+                passed = self.validate_announce_propagated(
+                    dest=validation['dest'],
+                    to_nodes=validation['nodes']
+                )
+            elif validator == 'resource_received':
+                passed = self.validate_resource_received(
+                    node=validation['node'],
+                    expected_hash=validation['hash']
+                )
+
+            if not passed:
+                all_passed = False
+                self.validation_errors.append({
+                    'scenario': scenario['name'],
+                    'validation': validator,
+                    'details': validation
+                })
+
+        return all_passed
+
+# Example test scenario definition
+SCENARIOS = [
+    {
+        'name': 'single_hop_packet_delivery',
+        'topology': 'linear_rust_python_rust',
+        'steps': [
+            {'action': 'wait', 'duration': 2},  # Let nodes initialize
+            {'action': 'send_packet', 'from': 0, 'to': 2, 'data': b'Hello'},
+            {'action': 'wait', 'duration': 1},
+        ],
+        'validations': [
+            {'type': 'packet_received', 'node': 2, 'data': b'Hello'}
+        ]
+    },
+    {
+        'name': 'announce_propagation',
+        'topology': 'linear_rust_python_rust',
+        'steps': [
+            {'action': 'announce', 'node': 0, 'app_name': 'test', 'aspect': 'echo'},
+            {'action': 'wait', 'duration': 5},
+        ],
+        'validations': [
+            {'type': 'announce_propagated', 'dest': 'test.echo', 'nodes': [1, 2]},
+            {'type': 'path_exists', 'from': 2, 'dest': 'test.echo'}
+        ]
+    },
+    {
+        'name': 'link_establishment_rust_to_python',
+        'topology': 'linear_rust_python_rust',
+        'steps': [
+            {'action': 'announce', 'node': 1, 'app_name': 'test', 'aspect': 'link'},
+            {'action': 'wait', 'duration': 2},
+            {'action': 'establish_link', 'from': 0, 'to': 'test.link'},
+            {'action': 'wait', 'duration': 2},
+        ],
+        'validations': [
+            {'type': 'link_established', 'from': 0, 'to': 1}
+        ]
+    },
+    {
+        'name': 'resource_transfer_bidirectional',
+        'topology': 'linear_rust_python_rust',
+        'steps': [
+            # Python -> Rust
+            {'action': 'announce', 'node': 2, 'app_name': 'test', 'aspect': 'file'},
+            {'action': 'wait', 'duration': 2},
+            {'action': 'establish_link', 'from': 1, 'to': 'test.file'},
+            {'action': 'wait', 'duration': 2},
+            {'action': 'transfer_resource', 'link': (1, 2), 'data': os.urandom(100000)},
+            {'action': 'wait', 'duration': 30},
+            # Rust -> Python
+            {'action': 'announce', 'node': 1, 'app_name': 'test', 'aspect': 'recv'},
+            {'action': 'wait', 'duration': 2},
+            {'action': 'establish_link', 'from': 0, 'to': 'test.recv'},
+            {'action': 'wait', 'duration': 2},
+            {'action': 'transfer_resource', 'link': (0, 1), 'data': os.urandom(100000)},
+            {'action': 'wait', 'duration': 30},
+        ],
+        'validations': [
+            {'type': 'resource_received', 'node': 2, 'hash': '...'},
+            {'type': 'resource_received', 'node': 1, 'hash': '...'}
+        ]
+    }
+]
+```
+
+**Test Runner (Rust Integration):**
+```rust
+// tests/integration/mod.rs
+use std::process::{Command, Child, Stdio};
+use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TestCommand {
+    command: String,
+    params: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TestResult {
+    success: bool,
+    data: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+pub struct PythonNode {
+    process: Child,
+    control_port: u16,
+}
+
+impl PythonNode {
+    pub fn spawn(config_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let process = Command::new("python3")
+            .arg("-m")
+            .arg("RNS.Utilities.rnsd")
+            .arg("-c")
+            .arg(config_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        // Wait for node to start and get control port
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        Ok(PythonNode {
+            process,
+            control_port: 9999, // From config
+        })
+    }
+
+    pub fn send_command(&mut self, cmd: TestCommand) -> Result<TestResult, Box<dyn std::error::Error>> {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.control_port))?;
+
+        let cmd_json = serde_json::to_string(&cmd)?;
+        stream.write_all(cmd_json.as_bytes())?;
+        stream.write_all(b"\n")?;
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+
+        let result: TestResult = serde_json::from_str(&response)?;
+        Ok(result)
+    }
+
+    pub fn get_identity_hash(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let cmd = TestCommand {
+            command: "get_identity".to_string(),
+            params: serde_json::json!({}),
+        };
+
+        let result = self.send_command(cmd)?;
+        if result.success {
+            let hash_hex = result.data.unwrap().as_str().unwrap();
+            Ok(hex::decode(hash_hex)?)
+        } else {
+            Err(result.error.unwrap().into())
+        }
+    }
+
+    pub fn shutdown(mut self) {
+        self.process.kill().expect("Failed to kill Python node");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rust_python_packet_exchange() {
+        // Create Python node
+        let mut python_node = PythonNode::spawn("tests/configs/python_node.ini")
+            .expect("Failed to spawn Python node");
+
+        // Create Rust node (in-process)
+        let mut rust_node = reticulum::Node::new()
+            .expect("Failed to create Rust node");
+
+        // Python announces a destination
+        let announce_result = python_node.send_command(TestCommand {
+            command: "announce".to_string(),
+            params: serde_json::json!({
+                "app_name": "test",
+                "aspect": "echo"
+            }),
+        }).expect("Failed to announce");
+
+        assert!(announce_result.success);
+
+        // Wait for announce to propagate
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Rust node should see the announced destination
+        let dest_hash = python_node.get_identity_hash()
+            .expect("Failed to get identity hash");
+
+        let has_path = rust_node.has_path(&dest_hash);
+        assert!(has_path, "Rust node should have path to Python destination");
+
+        // Send packet from Rust to Python
+        let packet_data = b"Hello from Rust!";
+        rust_node.send_packet(&dest_hash, packet_data)
+            .expect("Failed to send packet");
+
+        // Verify Python received it
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let received = python_node.send_command(TestCommand {
+            command: "get_received_packets".to_string(),
+            params: serde_json::json!({}),
+        }).expect("Failed to get received packets");
+
+        assert!(received.success);
+        let packets = received.data.unwrap().as_array().unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0]["data"].as_str().unwrap(), "Hello from Rust!");
+
+        // Cleanup
+        python_node.shutdown();
+    }
+}
+```
+
+#### 7.6.3 Continuous Validation Test Matrix
+
+**Test Matrix Coverage:**
+
+| Feature | Test Type | Python → Rust | Rust → Python | Rust ↔ Rust | Python ↔ Python |
+|---------|-----------|---------------|---------------|-------------|------------------|
+| **Packet Send** | Unit | ✓ | ✓ | ✓ | baseline |
+| **Packet Receive** | Unit | ✓ | ✓ | ✓ | baseline |
+| **Identity Hash** | Unit | ✓ | ✓ | ✓ | baseline |
+| **Signature** | Unit | ✓ | ✓ | ✓ | baseline |
+| **Encryption** | Unit | ✓ | ✓ | ✓ | baseline |
+| **Announce** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Path Discovery** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Link Request** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Link Active** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Link Data** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Resource Advertise** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Resource Transfer** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Multi-hop (2)** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Multi-hop (5)** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Multi-hop (10)** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Retransmission** | Integration | ✓ | ✓ | ✓ | baseline |
+| **Congestion** | Performance | ✓ | ✓ | ✓ | baseline |
+
+#### 7.6.4 Packet Capture and Analysis
+
+**Packet Capture Tool:**
+```python
+# tests/tools/packet_capture.py
+import RNS
+import struct
+import json
+from datetime import datetime
+
+class PacketCapture:
+    def __init__(self, capture_file: str):
+        self.capture_file = capture_file
+        self.packets = []
+
+    def capture_packet(self, packet: RNS.Packet, direction: str, node_id: str):
+        """Capture packet with metadata"""
+        raw_data = packet.raw
+
+        capture_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'node_id': node_id,
+            'direction': direction,  # 'tx' or 'rx'
+            'raw': raw_data.hex(),
+            'parsed': {
+                'flags': packet.flags,
+                'hops': packet.hops,
+                'destination': packet.destination_hash.hex(),
+                'transport_id': packet.transport_id.hex() if packet.transport_id else None,
+                'context': packet.context,
+                'data_len': len(packet.data),
+            }
+        }
+
+        self.packets.append(capture_entry)
+
+    def save(self):
+        """Save capture to JSON file"""
+        with open(self.capture_file, 'w') as f:
+            json.dump(self.packets, f, indent=2)
+
+    def compare_with_rust_capture(self, rust_capture_file: str) -> list:
+        """Compare Python capture with Rust capture to find differences"""
+        with open(rust_capture_file, 'r') as f:
+            rust_packets = json.load(f)
+
+        differences = []
+
+        # Match packets by timestamp and direction
+        for py_pkt in self.packets:
+            matching_rust = self.find_matching_packet(py_pkt, rust_packets)
+
+            if matching_rust is None:
+                differences.append({
+                    'type': 'missing_in_rust',
+                    'packet': py_pkt
+                })
+                continue
+
+            # Compare packet contents
+            if py_pkt['raw'] != matching_rust['raw']:
+                differences.append({
+                    'type': 'content_mismatch',
+                    'python': py_pkt,
+                    'rust': matching_rust,
+                    'diff': self.diff_packets(py_pkt, matching_rust)
+                })
+
+        return differences
+
+    def find_matching_packet(self, py_pkt: dict, rust_packets: list):
+        """Find matching packet in Rust capture"""
+        # Match by destination and data length (approximate)
+        for rust_pkt in rust_packets:
+            if (rust_pkt['parsed']['destination'] == py_pkt['parsed']['destination'] and
+                rust_pkt['parsed']['data_len'] == py_pkt['parsed']['data_len']):
+                return rust_pkt
+        return None
+
+    def diff_packets(self, py_pkt: dict, rust_pkt: dict) -> dict:
+        """Find differences between two packets"""
+        diff = {}
+
+        for key in py_pkt['parsed']:
+            if py_pkt['parsed'][key] != rust_pkt['parsed'][key]:
+                diff[key] = {
+                    'python': py_pkt['parsed'][key],
+                    'rust': rust_pkt['parsed'][key]
+                }
+
+        return diff
+```
+
+#### 7.6.5 State Comparison and Validation
+
+**State Validator:**
+```python
+# tests/tools/state_validator.py
+import RNS
+import json
+import socket
+
+class StateValidator:
+    def __init__(self, python_node, rust_node):
+        self.python_node = python_node
+        self.rust_node = rust_node
+
+    def compare_transport_state(self) -> dict:
+        """Compare transport layer state between implementations"""
+        py_state = self.get_python_transport_state()
+        rust_state = self.get_rust_transport_state()
+
+        differences = {}
+
+        # Compare path tables
+        path_diff = self.compare_path_tables(
+            py_state['path_table'],
+            rust_state['path_table']
+        )
+        if path_diff:
+            differences['path_table'] = path_diff
+
+        # Compare destination table
+        dest_diff = self.compare_destination_tables(
+            py_state['destinations'],
+            rust_state['destinations']
+        )
+        if dest_diff:
+            differences['destinations'] = dest_diff
+
+        # Compare link table
+        link_diff = self.compare_link_tables(
+            py_state['links'],
+            rust_state['links']
+        )
+        if link_diff:
+            differences['links'] = link_diff
+
+        return differences
+
+    def get_python_transport_state(self) -> dict:
+        """Get transport state from Python node"""
+        return {
+            'path_table': RNS.Transport.path_table,
+            'destinations': RNS.Transport.destinations,
+            'links': RNS.Transport.active_links,
+        }
+
+    def get_rust_transport_state(self) -> dict:
+        """Get transport state from Rust node via control API"""
+        cmd = {
+            'command': 'get_transport_state',
+            'params': {}
+        }
+
+        response = self.rust_node.send_command(cmd)
+        return response['data']
+
+    def compare_path_tables(self, py_table: dict, rust_table: dict) -> dict:
+        """Compare path tables"""
+        differences = {
+            'missing_in_rust': [],
+            'missing_in_python': [],
+            'mismatched_hops': [],
+            'mismatched_interface': []
+        }
+
+        py_dests = set(py_table.keys())
+        rust_dests = set(rust_table.keys())
+
+        differences['missing_in_rust'] = list(py_dests - rust_dests)
+        differences['missing_in_python'] = list(rust_dests - py_dests)
+
+        # Compare common entries
+        for dest in py_dests & rust_dests:
+            if py_table[dest]['hops'] != rust_table[dest]['hops']:
+                differences['mismatched_hops'].append({
+                    'dest': dest,
+                    'python_hops': py_table[dest]['hops'],
+                    'rust_hops': rust_table[dest]['hops']
+                })
+
+        return differences if any(differences.values()) else {}
+```
+
+#### 7.6.6 Automated Regression Testing
+
+**CI/CD Integration (GitHub Actions):**
+```yaml
+# .github/workflows/integration-tests.yml
+name: Integration Tests with Python Reference
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        topology: [linear, star, mesh]
+        test-suite: [basic, links, resources, routing]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python Reticulum
+        run: |
+          pip install rns
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build Rust implementation
+        run: cargo build --release
+
+      - name: Run integration tests
+        run: |
+          python tests/integration/orchestrator.py \
+            --topology ${{ matrix.topology }} \
+            --test-suite ${{ matrix.test-suite }} \
+            --capture-packets \
+            --compare-state
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-${{ matrix.topology }}-${{ matrix.test-suite }}
+          path: |
+            tests/results/
+            tests/captures/
+
+      - name: Generate comparison report
+        if: always()
+        run: |
+          python tests/tools/generate_report.py \
+            --results tests/results/ \
+            --output report.html
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: integration-report
+          path: report.html
+
+  compatibility-matrix:
+    runs-on: ubuntu-latest
+    needs: integration-test
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download all test results
+        uses: actions/download-artifact@v3
+        with:
+          path: all-results/
+
+      - name: Generate compatibility matrix
+        run: |
+          python tests/tools/compatibility_matrix.py \
+            --results all-results/ \
+            --output matrix.json
+
+      - name: Check compatibility threshold
+        run: |
+          python tests/tools/check_threshold.py \
+            --matrix matrix.json \
+            --min-pass-rate 95
+
+      - name: Post results to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const matrix = JSON.parse(fs.readFileSync('matrix.json', 'utf8'));
+
+            const comment = `## Integration Test Results
+
+            **Overall Pass Rate:** ${matrix.pass_rate}%
+
+            | Test Suite | Pass Rate | Details |
+            |------------|-----------|---------|
+            ${matrix.suites.map(s =>
+              `| ${s.name} | ${s.pass_rate}% | [View](${s.report_url}) |`
+            ).join('\n')}
+
+            ${matrix.pass_rate < 95 ? '⚠️ **Warning:** Pass rate below 95% threshold' : '✅ All tests passing'}
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+```
+
+#### 7.6.7 Differential Testing Strategy
+
+**Golden Test Corpus Generation:**
+```python
+# tests/corpus/generate_golden.py
+"""
+Generate golden test corpus from Python implementation
+This creates a set of known-good outputs for various inputs
+"""
+
+import RNS
+import json
+import hashlib
+
+class GoldenCorpusGenerator:
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        self.test_cases = []
+
+    def generate_identity_corpus(self, count: int = 100):
+        """Generate identity test cases"""
+        for i in range(count):
+            identity = RNS.Identity()
+
+            test_case = {
+                'name': f'identity_{i}',
+                'type': 'identity',
+                'input': {
+                    'seed': None,  # Random
+                },
+                'output': {
+                    'public_key': identity.pub.hex(),
+                    'hash': identity.hash.hex(),
+                }
+            }
+
+            self.test_cases.append(test_case)
+
+    def generate_packet_corpus(self, count: int = 1000):
+        """Generate packet encoding test cases"""
+        identity = RNS.Identity()
+        destination = RNS.Destination(
+            identity, RNS.Destination.IN,
+            RNS.Destination.SINGLE, "app", "test"
+        )
+
+        for i in range(count):
+            # Vary packet size, type, hops, etc.
+            data_len = random.randint(1, 465)
+            data = os.urandom(data_len)
+
+            packet = RNS.Packet(destination, data)
+
+            test_case = {
+                'name': f'packet_{i}',
+                'type': 'packet',
+                'input': {
+                    'destination_hash': destination.hash.hex(),
+                    'data': data.hex(),
+                    'packet_type': packet.packet_type,
+                    'hops': packet.hops,
+                },
+                'output': {
+                    'raw': packet.raw.hex(),
+                    'encrypted': packet.ciphertext.hex() if packet.ciphertext else None,
+                }
+            }
+
+            self.test_cases.append(test_case)
+
+    def generate_link_corpus(self):
+        """Generate link establishment test cases"""
+        # ... similar pattern
+
+    def save_corpus(self):
+        """Save corpus to JSON"""
+        corpus_file = f"{self.output_dir}/golden_corpus.json"
+        with open(corpus_file, 'w') as f:
+            json.dump(self.test_cases, f, indent=2)
+
+        print(f"Generated {len(self.test_cases)} test cases")
+        print(f"Corpus hash: {self.corpus_hash()}")
+
+    def corpus_hash(self) -> str:
+        """Generate hash of entire corpus for versioning"""
+        corpus_str = json.dumps(self.test_cases, sort_keys=True)
+        return hashlib.sha256(corpus_str.encode()).hexdigest()
+
+# Run on Python implementation to generate golden corpus
+generator = GoldenCorpusGenerator("tests/corpus")
+generator.generate_identity_corpus(100)
+generator.generate_packet_corpus(1000)
+generator.generate_link_corpus()
+generator.save_corpus()
+```
+
+**Rust Golden Test Runner:**
+```rust
+// tests/golden_tests.rs
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::BufReader;
+
+#[derive(Debug, Deserialize)]
+struct GoldenTestCase {
+    name: String,
+    #[serde(rename = "type")]
+    test_type: String,
+    input: serde_json::Value,
+    output: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoldenCorpus {
+    test_cases: Vec<GoldenTestCase>,
+}
+
+fn load_golden_corpus() -> GoldenCorpus {
+    let file = File::open("tests/corpus/golden_corpus.json")
+        .expect("Failed to open golden corpus");
+    let reader = BufReader::new(file);
+    serde_json::from_reader(reader).expect("Failed to parse golden corpus")
+}
+
+#[test]
+fn test_identity_against_golden() {
+    let corpus = load_golden_corpus();
+
+    for test_case in corpus.test_cases.iter().filter(|tc| tc.test_type == "identity") {
+        let input = &test_case.input;
+        let expected_output = &test_case.output;
+
+        // Create identity (with same seed if provided)
+        let identity = if let Some(seed) = input.get("seed") {
+            Identity::from_seed(seed.as_str().unwrap())
+        } else {
+            continue; // Skip random cases
+        };
+
+        // Check public key matches
+        let expected_pubkey = expected_output["public_key"].as_str().unwrap();
+        let actual_pubkey = hex::encode(&identity.public_key());
+
+        assert_eq!(
+            expected_pubkey, actual_pubkey,
+            "Test case '{}' failed: public key mismatch",
+            test_case.name
+        );
+
+        // Check hash matches
+        let expected_hash = expected_output["hash"].as_str().unwrap();
+        let actual_hash = hex::encode(&identity.hash());
+
+        assert_eq!(
+            expected_hash, actual_hash,
+            "Test case '{}' failed: hash mismatch",
+            test_case.name
+        );
+    }
+}
+
+#[test]
+fn test_packet_encoding_against_golden() {
+    let corpus = load_golden_corpus();
+
+    let mut failures = Vec::new();
+
+    for test_case in corpus.test_cases.iter().filter(|tc| tc.test_type == "packet") {
+        let input = &test_case.input;
+        let expected_output = &test_case.output;
+
+        // Create packet
+        let dest_hash = hex::decode(input["destination_hash"].as_str().unwrap()).unwrap();
+        let data = hex::decode(input["data"].as_str().unwrap()).unwrap();
+
+        let packet = Packet::new(&dest_hash, &data);
+
+        // Check raw encoding matches
+        let expected_raw = expected_output["raw"].as_str().unwrap();
+        let actual_raw = hex::encode(&packet.pack());
+
+        if expected_raw != actual_raw {
+            failures.push(format!(
+                "Test case '{}' failed: packet encoding mismatch\nExpected: {}\nActual: {}",
+                test_case.name, expected_raw, actual_raw
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!("Golden tests failed:\n{}", failures.join("\n\n"));
+    }
+}
+```
+
+#### 7.6.8 Performance Regression Detection
+
+**Benchmark Comparison Tool:**
+```python
+# tests/tools/benchmark_comparison.py
+"""
+Compare performance between Python and Rust implementations
+Detect regressions automatically
+"""
+
+import subprocess
+import json
+import statistics
+
+class BenchmarkComparison:
+    def __init__(self):
+        self.python_results = {}
+        self.rust_results = {}
+
+    def run_python_benchmarks(self):
+        """Run benchmarks on Python implementation"""
+        benchmarks = [
+            'packet_encode',
+            'packet_decode',
+            'sign',
+            'verify',
+            'encrypt',
+            'decrypt',
+            'path_lookup',
+        ]
+
+        for bench in benchmarks:
+            times = []
+            for _ in range(100):
+                result = subprocess.run(
+                    ['python', 'tests/benchmarks/bench_python.py', bench],
+                    capture_output=True, text=True
+                )
+                time_us = float(result.stdout.strip())
+                times.append(time_us)
+
+            self.python_results[bench] = {
+                'mean': statistics.mean(times),
+                'median': statistics.median(times),
+                'stdev': statistics.stdev(times),
+                'min': min(times),
+                'max': max(times),
+            }
+
+    def run_rust_benchmarks(self):
+        """Run benchmarks on Rust implementation"""
+        result = subprocess.run(
+            ['cargo', 'bench', '--', '--output-format', 'json'],
+            capture_output=True, text=True
+        )
+
+        # Parse criterion.rs output
+        bench_data = json.loads(result.stdout)
+
+        for bench in bench_data['benchmarks']:
+            name = bench['name']
+            self.rust_results[name] = {
+                'mean': bench['mean']['estimate'],
+                'median': bench['median']['estimate'],
+                'stdev': bench['std_dev']['estimate'],
+                'min': bench['min'],
+                'max': bench['max'],
+            }
+
+    def compare(self) -> dict:
+        """Compare results and detect regressions"""
+        comparison = {}
+
+        for bench_name in self.python_results:
+            if bench_name not in self.rust_results:
+                continue
+
+            py_mean = self.python_results[bench_name]['mean']
+            rust_mean = self.rust_results[bench_name]['mean']
+
+            speedup = py_mean / rust_mean
+
+            comparison[bench_name] = {
+                'python_mean_us': py_mean,
+                'rust_mean_us': rust_mean,
+                'speedup': speedup,
+                'rust_faster': speedup > 1.0,
+                'regression': speedup < 0.5,  # Rust slower than 50% of Python
+            }
+
+        return comparison
+
+    def generate_report(self, comparison: dict):
+        """Generate HTML report"""
+        # ... generate visual report
+```
+
+#### 7.6.9 Feedback Loop Integration
+
+**Development Workflow:**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  Developer Workflow                     │
+└─────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+        ┌─────────────────────────────────────┐
+        │  1. Write Rust Code                 │
+        │     - Implement feature             │
+        │     - Add unit tests                │
+        └─────────────────────────────────────┘
+                            │
+                            ▼
+        ┌─────────────────────────────────────┐
+        │  2. Local Integration Tests         │
+        │     make test-integration           │
+        └─────────────────────────────────────┘
+                            │
+                ┌───────────┴──────────┐
+                │ PASS        FAIL     │
+                ▼                      ▼
+        ┌───────────┐      ┌──────────────────┐
+        │ Continue  │      │ Check Diff Report │
+        └───────────┘      │  - Packet capture │
+                │          │  - State diff     │
+                │          │  - Golden tests   │
+                │          └──────────────────┘
+                │                     │
+                │                     ▼
+                │          ┌──────────────────┐
+                │          │  Debug & Fix     │
+                │          └──────────────────┘
+                │                     │
+                └─────────────────────┘
+                            │
+                            ▼
+        ┌─────────────────────────────────────┐
+        │  3. Commit & Push                   │
+        └─────────────────────────────────────┘
+                            │
+                            ▼
+        ┌─────────────────────────────────────┐
+        │  4. CI Runs Full Test Suite         │
+        │     - All topologies                │
+        │     - All test scenarios            │
+        │     - Performance benchmarks        │
+        └─────────────────────────────────────┘
+                            │
+                ┌───────────┴──────────┐
+                │ PASS        FAIL     │
+                ▼                      ▼
+        ┌───────────┐      ┌──────────────────┐
+        │ Merge OK  │      │ PR Comment with  │
+        └───────────┘      │ - Failing tests  │
+                           │ - Diff artifacts │
+                           │ - Suggestions    │
+                           └──────────────────┘
+```
+
+**Make targets for developers:**
+```makefile
+# Makefile
+.PHONY: test-integration test-quick test-full test-compatibility
+
+# Quick sanity test (5 minutes)
+test-quick:
+	python tests/integration/orchestrator.py \
+		--topology linear \
+		--test-suite basic \
+		--quick
+
+# Full integration suite (30 minutes)
+test-integration:
+	python tests/integration/orchestrator.py \
+		--topology all \
+		--test-suite all \
+		--capture-packets \
+		--compare-state
+
+# Full compatibility matrix (1 hour)
+test-full:
+	python tests/integration/run_all.py \
+		--matrix tests/integration/full_matrix.json \
+		--parallel 4
+
+# Check against golden corpus
+test-compatibility:
+	cargo test --test golden_tests
+	python tests/tools/check_corpus.py
+
+# Generate new golden corpus from Python
+corpus-update:
+	python tests/corpus/generate_golden.py
+```
+
+This comprehensive testing framework provides:
+
+1. **Automated validation** of every feature against Python reference
+2. **Continuous feedback** during development via quick local tests
+3. **Detailed diagnostics** when tests fail (packet captures, state diffs)
+4. **Regression prevention** via golden test corpus
+5. **Performance tracking** to ensure Rust version meets targets
+6. **CI/CD integration** for automated PR validation
+
 ---
 
 ## 8. Performance Targets
